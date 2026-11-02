@@ -4,6 +4,7 @@ import os
 import yaml
 import time
 import sys
+import gc
 
 from pathlib import Path
 from multiprocessing import Pool
@@ -86,27 +87,38 @@ def ecalc_npv_par(pred_data, **kwargs):
         # calculate NPV values
         indecies = [n for n in range(ne)]
 
-        n_par = keys_opt.get('parallel', 50)
+        # eCalc runs in the main process, so its pool size is set separately from 'parallel' (the number of
+        # forward simulations, which on HPC can be far more than the CPUs and memory of the main job)
+        n_par = keys_opt.get('ecalc_parallel', keys_opt.get('parallel', 50))
 
         # Each worker starts its own NeqSim JVM (via eCalc). Cap the JVM heap, and recycle workers after a few
         # tasks so the JVMs do not grow until the machine runs out of memory.
         os.environ.setdefault('JAVA_TOOL_OPTIONS', keys_opt.get('ecalc_java_options', '-Xmx1g'))
         max_tasks = keys_opt.get('ecalc_tasks_per_worker', 5)
-        with Pool(n_par, maxtasksperchild=max_tasks) as pool:
-            values = pool.map(_safe_objective, indecies)
 
-        # Retry failed members in fresh processes (a crashed JVM cannot be reused within the same worker)
-        failed = [n for n, v in zip(indecies, values) if v is None]
-        if failed:
-            with Pool(min(n_par, len(failed)), maxtasksperchild=1) as retry_pool:
-                for n, v in zip(failed, retry_pool.map(_safe_objective, failed)):
-                    values[n] = v
-            # Members that fail again get NaN; the optimizer skips non-finite members in the gradient
-            still_failed = [n for n in indecies if values[n] is None]
-            if still_failed:
-                print(f'eCalc failed for members {still_failed} after retry, setting their objective to NaN', flush=True)
-                for n in still_failed:
-                    values[n] = np.nan
+        # The workers are forked and share the parent's memory copy-on-write. Freeze the existing objects so
+        # the garbage collector in the workers does not touch (and thereby copy) them.
+        gc.collect()
+        gc.freeze()
+        try:
+            with Pool(n_par, maxtasksperchild=max_tasks) as pool:
+                values = pool.map(_safe_objective, indecies)
+
+            # Retry failed members in fresh processes (a crashed JVM cannot be reused within the same worker)
+            failed = [n for n, v in zip(indecies, values) if v is None]
+            if failed:
+                with Pool(min(n_par, len(failed)), maxtasksperchild=1) as retry_pool:
+                    for n, v in zip(failed, retry_pool.map(_safe_objective, failed)):
+                        values[n] = v
+                # Members that fail again get NaN; the optimizer skips non-finite members in the gradient
+                still_failed = [n for n in indecies if values[n] is None]
+                if still_failed:
+                    print(f'eCalc failed for members {still_failed} after retry, setting their objective to NaN', flush=True)
+                    for n in still_failed:
+                        values[n] = np.nan
+        finally:
+            # Make the frozen objects collectable again, otherwise they are kept for the rest of the run
+            gc.unfreeze()
 
         objective[l].extend(values)
         objective[l] = np.array(objective[l]) / const.get('obj_scaling', 1)
@@ -137,15 +149,17 @@ def _objective(args):
     water_inj = sim_data['fwit'][nc]
 
     # Check if reinjection is used - reinjected water may come from other assets (if water_inj > water_prood)
-    if 'wwri' in const:
+    # Do not write to const here: it is shared by all members a worker evaluates, so the choice must stay local
+    wwri = const.get('wwri')
+    if wwri is not None:
         water_prod = np.maximum(water_prod - water_inj, 0.0)  # pay only for produced water that is not reinjected
         water_reinj = water_inj  # pay for separation of the reinjected water (wwri is mainly the cost of separation)
     else:
         water_reinj = 0.0
-        const['wwri'] = 0.0
+        wwri = 0.0
 
     value = (oil_export * const['wop'] + gas_export * const['wgp'] - water_prod * const['wwp'] -
-             water_inj * const['wwi'] - water_reinj * const['wwri'] -
+             water_inj * const['wwi'] - water_reinj * wwri -
              em_mass * const['wem'] - el_usage * const['wel']) / (
                     (1 + const['disc']) ** (np.cumsum(sim_data['days']) / 365))
 
