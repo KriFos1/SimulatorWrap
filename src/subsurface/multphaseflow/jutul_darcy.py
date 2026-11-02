@@ -16,6 +16,10 @@ It supports:
   deck makes other quantities depend on the permeability field: a COMPDAT
   connection factor left defaulted (well-index chain rule) and PERMY/PERMZ
   produced by ``COPY`` from PERMX. Both are detected from the deck by default.
+* Weighted adjoints: ``H^T w`` for a weight per datum, in a single adjoint
+  solve per member regardless of the number of data. With
+  ``w = Cd^{-1} (d_obs - d_sim)`` this is the data-misfit term of the
+  log-posterior gradient used by e.g. Stein variational gradient descent.
 
 The wrapper communicates with Julia via :mod:`juliacall`. Heavy Julia state
 is created lazily inside worker processes so the class can be pickled for
@@ -79,6 +83,14 @@ CUMULATIVE_KEYS: frozenset[str] = frozenset({
     "WOPT", "WGPT", "WWPT", "WLPT",
 })
 
+#: Seconds per time unit of a rate in each unit system (Sm3/day in METRIC,
+#: stb/day in FIELD, cc/hour in LAB). JutulDarcy's summary integrates rates
+#: over seconds to get cumulative totals, so those come out too large by this
+#: factor in any system other than SI.
+RATE_TIME_UNIT_SECONDS: dict[str, int] = {
+    "si": 1, "metric": SECONDS_PER_DAY, "field": SECONDS_PER_DAY, "lab": 3_600,
+}
+
 VALID_OUTPUT_FORMATS: frozenset[str] = frozenset({"list", "dict", "dataframe"})
 VALID_ADJOINT_MODES: frozenset[str]  = frozenset({"sensitivities", "optimization"})
 VALID_REPORT_TYPES: frozenset[str]   = frozenset({"days", "dates"})
@@ -137,6 +149,12 @@ PERM_COPY_RTOL: float = 1e-10
 #: survives this comparison came from the Peaceman formula rather than the deck.
 WI_PEACEMAN_RTOL: float = 1e-10
 
+#: Tolerance in seconds for matching a ministep's end time to a report point.
+#: Ministep times are floating-point cumulative sums and can miss the whole
+#: second they belong to by a fraction of a second, while no ministep is
+#: anywhere near this short.
+STEP_TIME_TOL: float = 0.5
+
 #: Julia helpers that JutulDarcy does not expose itself. Defined once per Julia
 #: session by :func:`_ensure_julia_helpers`.
 #:
@@ -163,6 +181,11 @@ WI_PEACEMAN_RTOL: float = 1e-10
 #:     One adjoint sweep against pre-built storage, stopping at `n_steps`. An
 #:     objective that only fires at report step k has zero adjoint contribution
 #:     from every later step, so sweeping them is wasted work.
+#:
+#: ``subsurface_weighted_well_objective``
+#:     ``sum_i w_i * d_i`` over well data ``d_i`` as one sum objective, so its
+#:     gradient is ``H^T w`` from a single adjoint solve. Entries sharing a well
+#:     and quantity are grouped, so each ministep evaluates that quantity once.
 _JULIA_HELPERS: str = """
 function subsurface_sensitivities_with_wells(case, result, obj)
     sens = Jutul.solve_adjoint_sensitivities(case, result, obj)
@@ -285,6 +308,43 @@ function subsurface_sensitivities_reuse(case, storage, packed, obj, n_steps)
         grad[k, Jutul.associated_entity(pdef)] = rsens[k]
     end
     return (reservoir = grad, models = sens)
+end
+
+function subsurface_weighted_well_objective(wells, targets, is_rate, times, weights, tol)
+    groups = Dict{Tuple{Symbol, Symbol, Bool}, Tuple{Vector{Float64}, Vector{Float64}}}()
+    for (w, tgt, r, t, c) in zip(String.(wells), String.(targets), Bool.(collect(is_rate)),
+                                 Float64.(collect(times)), Float64.(collect(weights)))
+        ts, cs = get!(groups, (Symbol(w), Symbol(tgt), r), (Float64[], Float64[]))
+        push!(ts, t)
+        push!(cs, c)
+    end
+    terms = [
+        (well = k[1], target = getfield(JutulDarcy, k[2]), is_rate = k[3],
+         times = v[1], weights = v[2])
+        for (k, v) in groups
+    ]
+
+    function weighted_well_objective(model, state, dt, step_info, forces)
+        t = step_info[:time]
+        obj = 0.0
+        for term in terms
+            # A rate datum is the rate over the ministep ending at its report
+            # time; a cumulative datum integrates every ministep up to it.
+            c = 0.0
+            for (tk, wk) in zip(term.times, term.weights)
+                hit = term.is_rate ? abs(t - tk) <= tol : t <= tk + tol
+                hit && (c += wk)
+            end
+            c == 0.0 && continue
+            ctrl = forces[:Facility].control[term.well]
+            sgn = ctrl isa JutulDarcy.ProducerControl ? -1.0 : 1.0
+            q = JutulDarcy.compute_well_qoi(model, state, forces, term.well, term.target)
+            # Rates are reported in Sm3/day, cumulatives in Sm3.
+            obj += c * sgn * q * (term.is_rate ? si_unit(:day) : dt)
+        end
+        return obj
+    end
+    return weighted_well_objective
 end
 """
 
@@ -1000,7 +1060,7 @@ def well_QOI_objective(wellID: str, phaseID: str, time: Iterable[float],
             obj = julia.seval(
                 f"""
                 function well_QOI_{i}(model, state, dt, step_info, forces)
-                    if step_info[:time] != {sec}
+                    if !isapprox(step_info[:time], {sec}; rtol=1e-9, atol=1e-6)
                         return 0.0
                     end
                     ctrl = forces[:Facility].control[Symbol("{wellID}")]
@@ -1062,6 +1122,18 @@ class JutulDarcy:
 
         - ``adjoints`` : dict
             Objective/parameter spec; enables adjoint computation.
+
+        - ``weighted_adjoint`` : dict
+            ``{"parameters": [...]}``; enables the weighted adjoint ``H^T w``
+            for the weights given by ``adjoint_weights``. Cannot be combined
+            with ``adjoints``.
+
+        - ``adjoint_weights`` : pandas.DataFrame or callable
+            Weights for ``weighted_adjoint``, laid out like the forward
+            output (report points x datatypes; absent cells weigh zero). A
+            callable is called as ``adjoint_weights(forward_df, member)``
+            after each forward run and returns such a frame, so weights may
+            depend on the simulated data. May also be set as an attribute.
 
         - ``output_format`` : {"list", "dict", "dataframe"}
             Output container type. Default ``"dataframe"``.
@@ -1136,13 +1208,25 @@ class JutulDarcy:
         )
 
         # ---- Adjoint configuration --------------------------------------- #
+        if "adjoints" in options and "weighted_adjoint" in options:
+            raise ValueError(
+                "'adjoints' and 'weighted_adjoint' are mutually exclusive"
+            )
+        self.adjoint_info: dict[str, AdjointObjective] = {}
+        self.weighted_parameters: list[str] | None = None
         if "adjoints" in options:
             self.compute_adjoints = True
             self.adjoint_info = _process_adjoint_info(options["adjoints"])
             self.eval_adjoint_funcs = options.get("eval_adjoint_funcs", False)
+        elif "weighted_adjoint" in options:
+            self.compute_adjoints = True
+            params = options["weighted_adjoint"]["parameters"]
+            self.weighted_parameters = [params] if isinstance(params, str) else list(params)
+            self.eval_adjoint_funcs = False
         else:
             self.compute_adjoints = False
             self.eval_adjoint_funcs = False
+        self.adjoint_weights = options.get("adjoint_weights")
         self.adjoint_funcs: pd.DataFrame | None = None
 
         # ---- Output / execution options ---------------------------------- #
@@ -1175,6 +1259,8 @@ class JutulDarcy:
                 f"Invalid adjoint_mode '{self.adjoint_mode}'. "
                 f"Must be one of {sorted(VALID_ADJOINT_MODES)}"
             )
+        if self.weighted_parameters is not None and self.adjoint_mode != "sensitivities":
+            raise ValueError("'weighted_adjoint' requires adjoint_mode 'sensitivities'")
         self.optimization_targets = options.get("optimization_targets")
 
         # ---- PET compatibility attributes -------------------------------- #
@@ -1205,6 +1291,10 @@ class JutulDarcy:
             Same shape as above, but each result is a ``(forward, adjoint)``
             tuple where ``adjoint`` is a :class:`pandas.DataFrame` with a
             ``(objective, parameter)`` MultiIndex on the columns.
+        Weighted-adjoint mode
+            As adjoint mode, but ``adjoint`` is a :class:`pandas.Series` of
+            full-grid gradients ``H^T w`` indexed by parameter, with the
+            weighted sum ``w^T d`` in ``adjoint.attrs["value"]``.
         """
         # Normalise to a list so the parallel path is uniform.
         if isinstance(inputs, (dict, str)):
@@ -1294,6 +1384,12 @@ class JutulDarcy:
                 pyres = self.extract_datatypes(jlres, case, units, julia)
                 output = self._format_output(pyres)
 
+                if self.weighted_parameters is not None:
+                    adjoint = self._compute_weighted_adjoint(
+                        case, jlres, pyres, units, actnum_vec, idn, julia
+                    )
+                    return output, adjoint
+
                 if self.compute_adjoints:
                     adjoints = self._compute_adjoints(
                         case, jlres, pyres, units, actnum_vec, idn, julia
@@ -1371,12 +1467,13 @@ class JutulDarcy:
         Returns
         -------
         str
-            One of ``"metric"``, ``"si"``, ``"field"`` if specified.
+            One of ``"metric"``, ``"si"``, ``"field"``, ``"lab"`` if specified.
         Any
             ``julia.missing`` if no unit keyword is present.
         """
         runspec = case.input_data["RUNSPEC"]
-        for key, name in (("METRIC", "metric"), ("SI", "si"), ("FIELD", "field")):
+        for key, name in (("METRIC", "metric"), ("SI", "si"), ("FIELD", "field"),
+                          ("LAB", "lab")):
             if julia.haskey(runspec, key):
                 return name
         return julia.missing
@@ -1561,6 +1658,11 @@ class JutulDarcy:
         wells = smry["VALUES"]["WELLS"]
         field = smry["VALUES"]["FIELD"]
 
+        # `summary_result` falls back to METRIC when the deck names no system.
+        cumulative_scale = RATE_TIME_UNIT_SECONDS[
+            str(smry["UNIT_SYSTEM"]).lower()
+        ]
+
         for datatype in self.datatype:
             if ":" in datatype:
                 # Well-level datatype: "<baseID>:<wellID>"
@@ -1584,6 +1686,9 @@ class JutulDarcy:
                     )
                 res[datatype] = np.array(field[datatype])[idx]
                 attrs[datatype] = get_metric_unit(datatype)
+
+            if datatype.split(":")[0] in CUMULATIVE_KEYS:
+                res[datatype] = res[datatype] / cumulative_scale
 
         df = pd.DataFrame(res, index=self.index[1])
         df.index.name = self.index[0]
@@ -1667,37 +1772,17 @@ class JutulDarcy:
 
         # dWI/dK depends only on the case, so it is built once and contracted
         # with each objective's dJ/dWI below.
-        needs_perm = any(
-            "perm" in param.lower()
-            for obj in self.adjoint_info.values()
-            for param in obj.parameters
+        wi_jacobian, ncells, perm_copy = self._perm_gradient_context(
+            case, actnum_vec,
+            [p for obj in self.adjoint_info.values() for p in obj.parameters],
+            julia,
         )
-        if needs_perm:
-            wi_jacobian, ncells = _well_index_perm_jacobian(
-                case, julia, self.well_index_from_perm
-            )
-            perm_copy = _detect_copied_perm_axes(
-                case, actnum_vec, self.perm_copied, julia
-            )
-        else:
-            wi_jacobian, ncells, perm_copy = {}, 0, None
 
         # Build the adjoint storage and the ministep expansion once per member.
         # `solve_adjoint_sensitivities` does both on every call, which is pure
         # repetition when a member has many objectives. `step_times` then lets
         # each objective stop its backward sweep at its own evaluation point.
-        step_times = None
-        if self.adjoint_mode == "sensitivities" and self.adjoint_reuse_storage:
-            julia.adj_packed = _suppress_julia(
-                julia, "subsurface_adjoint_packed(case, res)"
-            )
-            julia.adj_storage = _suppress_julia(
-                julia, "subsurface_adjoint_storage(case)"
-            )
-            step_times = np.asarray(
-                _suppress_julia(julia, "subsurface_packed_step_times(adj_packed)"),
-                dtype=float,
-            )
+        step_times = self._prepare_adjoint_storage(julia)
 
         pbar = self._make_adjoint_pbar(idn)
         sim_times = np.array(jlres.time) # Unit: seconds
@@ -1775,6 +1860,182 @@ class JutulDarcy:
             self.adjoint_funcs = fun
 
         return adjoints
+
+    def _compute_weighted_adjoint(self, case, jlres, pyres, units, actnum_vec,
+                                  idn: int, julia) -> pd.Series:
+        """
+        Compute ``H^T w``, the gradient of ``sum_i w_i d_i`` with ``w`` held fixed.
+
+        ``H^T w`` is linear in ``w``, so weights computed from this member's
+        own forward run give the exact gradient of any function of the data
+        through them, in one adjoint solve. ``w = Cd^{-1} (d_obs - d)`` gives
+        the Gaussian log-likelihood gradient
+        ``-d/dx 1/2 (d_obs - d)^T Cd^{-1} (d_obs - d)``.
+
+        Parameters
+        ----------
+        case : Any
+            Julia case object.
+        jlres : Any
+            Julia simulation result.
+        pyres : pd.DataFrame
+            Forward-extracted results; passed to a callable ``adjoint_weights``
+            and used to cross-check Jutul's evaluation of the weighted sum.
+        units : Any
+            Unit system identifier (stored in the returned ``attrs``).
+        actnum_vec : np.ndarray
+            Flat ACTNUM vector for full-grid embedding.
+        idn : int
+            Ensemble index, passed to a callable ``adjoint_weights``.
+        julia : juliacall.Main
+            Julia main module.
+
+        Returns
+        -------
+        pd.Series
+            Full-grid gradient per parameter in ``self.weighted_parameters``.
+            ``attrs["value"]`` is ``sum_i w_i d_i`` from the forward output.
+
+        Raises
+        ------
+        ValueError
+            If a weighted datatype is not a supported well quantity, or Jutul's
+            evaluation of the weighted sum disagrees with the forward output.
+        """
+        weights = self._resolve_adjoint_weights(pyres, idn)
+        w = weights.to_numpy()
+        rows, cols = np.nonzero(w)
+        contributions = w[rows, cols] * pyres.to_numpy(dtype=np.float64)[rows, cols]
+        value = float(contributions.sum())
+
+        def _pack(grads: dict[str, np.ndarray]) -> pd.Series:
+            out = pd.Series(list(grads.values()), index=list(grads),
+                            name="weighted_adjoint", dtype=object)
+            out.attrs = {"value": value, "units": units}
+            return out
+
+        if not rows.size:
+            return _pack({p: np.zeros(actnum_vec.shape)
+                          for p in self.weighted_parameters})
+
+        wells, targets, is_rate = [], [], []
+        for datatype in weights.columns[cols]:
+            base, _, well = datatype.partition(":")
+            if not well or base not in PHASE_MAP:
+                raise ValueError(
+                    f"No weighted adjoint for datatype '{datatype}'; supported "
+                    f"are well data of type {sorted(PHASE_MAP)}"
+                )
+            phase, rate = PHASE_MAP[base]
+            wells.append(well)
+            targets.append(RATE_ID_MAP[phase])
+            is_rate.append(rate)
+        times = self.report_seconds[rows].astype(np.float64)
+
+        julia.func = julia.subsurface_weighted_well_objective(
+            wells, targets, np.array(is_rate), times, w[rows, cols], STEP_TIME_TOL
+        )
+
+        # The weighted sum may cancel to near zero, so compare on the scale of
+        # its terms rather than of its value.
+        func_val = float(julia.Jutul.evaluate_objective(julia.func, case, jlres.result))
+        if abs(func_val - value) > 1e-6 * np.abs(contributions).sum():
+            raise ValueError(
+                f"Jutul evaluates the weighted sum to {func_val:.6e} but the "
+                f"forward output gives {value:.6e}; the adjoint objective does "
+                f"not reproduce the reported data"
+            )
+
+        step_times = self._prepare_adjoint_storage(julia)
+        n_steps = None
+        if step_times is not None:
+            # Nothing after the last weighted report point enters the sum.
+            n_steps = int(np.searchsorted(
+                step_times, times.max() + STEP_TIME_TOL, side="right"
+            ))
+        grad, well_sens = self._solve_adjoint(julia, n_steps=n_steps)
+
+        wi_jacobian, ncells, perm_copy = self._perm_gradient_context(
+            case, actnum_vec, self.weighted_parameters, julia
+        )
+        wi_chain_term = (
+            _well_index_chain_term(wi_jacobian, well_sens, ncells, julia)
+            if wi_jacobian else None
+        )
+        return _pack({
+            p: _extract_adjoint(grad, case, p, actnum_vec, perm_copy, julia,
+                                wi_chain_term=wi_chain_term)
+            for p in self.weighted_parameters
+        })
+
+    def _resolve_adjoint_weights(self, pyres: pd.DataFrame, idn: int) -> pd.DataFrame:
+        """
+        Return this member's weights aligned with ``pyres``, zero where absent.
+
+        Raises
+        ------
+        ValueError
+            If no weights are configured, or they name report points or
+            datatypes the forward output does not have.
+        """
+        weights = self.adjoint_weights
+        if weights is None:
+            raise ValueError(
+                "'weighted_adjoint' needs 'adjoint_weights' (a DataFrame or a "
+                "callable returning one)"
+            )
+        if callable(weights):
+            weights = weights(pyres.copy(), idn)
+        weights = pd.DataFrame(weights)
+
+        extra_cols = [c for c in weights.columns if c not in pyres.columns]
+        extra_rows = [r for r in weights.index if r not in pyres.index]
+        if extra_cols or extra_rows:
+            raise ValueError(
+                f"Adjoint weights name data the simulation does not report: "
+                f"datatypes {extra_cols}, report points {extra_rows}"
+            )
+        weights = weights.reindex(index=pyres.index, columns=pyres.columns)
+        return weights.fillna(0.0).astype(np.float64)
+
+    def _perm_gradient_context(self, case, actnum_vec: np.ndarray,
+                               parameters: Iterable[str], julia):
+        """
+        Build what permeability gradients need beyond the adjoint solve itself.
+
+        Returns
+        -------
+        tuple
+            ``(wi_jacobian, ncells, perm_copy)`` for
+            :func:`_well_index_chain_term` and :func:`_extract_adjoint`; empty
+            when none of ``parameters`` is a permeability.
+        """
+        if not any("perm" in p.lower() for p in parameters):
+            return {}, 0, None
+        wi_jacobian, ncells = _well_index_perm_jacobian(
+            case, julia, self.well_index_from_perm
+        )
+        perm_copy = _detect_copied_perm_axes(case, actnum_vec, self.perm_copied, julia)
+        return wi_jacobian, ncells, perm_copy
+
+    def _prepare_adjoint_storage(self, julia) -> np.ndarray | None:
+        """
+        Bind ``adj_packed`` / ``adj_storage`` in Julia for reuse across solves.
+
+        Returns
+        -------
+        np.ndarray or None
+            End time in seconds of every ministep, or ``None`` when storage
+            reuse is off or does not apply to the adjoint mode.
+        """
+        if not (self.adjoint_mode == "sensitivities" and self.adjoint_reuse_storage):
+            return None
+        julia.adj_packed = _suppress_julia(julia, "subsurface_adjoint_packed(case, res)")
+        julia.adj_storage = _suppress_julia(julia, "subsurface_adjoint_storage(case)")
+        return np.asarray(
+            _suppress_julia(julia, "subsurface_packed_step_times(adj_packed)"),
+            dtype=float,
+        )
 
     def _solve_adjoint(self, julia, n_steps: int | None = None):
         """
