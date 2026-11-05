@@ -5,11 +5,24 @@ import os,sys
 import shutil
 import re
 import time
-from datetime import timedelta
 
 # Internal imports
 from subsurface.multphaseflow.eclipse import eclipse
 from misc.system_tools.environ_var import OPMRunEnvironment
+
+
+def _slurm_time(sim_limit):
+    """Format a time limit for Slurm's --time: seconds (int/float) become D-HH:MM:SS, a string is used as is.
+
+    str(timedelta) gives '1 day, 12:00:00' for 36 hours, which sbatch rejects, so days are formatted explicitly.
+    """
+    if isinstance(sim_limit, str):
+        return sim_limit
+    seconds = int(round(sim_limit))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{days}-{hours:02d}:{minutes:02d}:{seconds:02d}' if days else f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
 class flow(eclipse):
@@ -136,8 +149,7 @@ class flow(eclipse):
         n_tasks = match.group(1) if match else 1
 
         # extract the sim_limit from kwargs. Default is 1 hour
-        sim_limit = kwargs.get("sim_limit", None)
-        sim_limit_str = f'--time={str(timedelta(seconds=sim_limit))}' if sim_limit is not None else "--time=01:00:00"
+        sim_limit_str = f'--time={_slurm_time(kwargs.get("sim_limit", 3600))}'
 
         # extract estimated memory requirement (Gigabyte) for a job
         mem = str(kwargs.get("mem", "4G"))
@@ -235,15 +247,7 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
         num_tasks = end_idx - start_idx
 
         # Extract options
-        sim_limit = kwargs.get("sim_limit", None)
-        if sim_limit is not None:
-            if isinstance(sim_limit, (int, float)):
-                from datetime import timedelta
-                sim_limit_str = f'--time={str(timedelta(seconds=sim_limit))}'
-            else:
-                sim_limit_str = f'--time={sim_limit}'
-        else:
-            sim_limit_str = "--time=02:00:00"
+        sim_limit_str = f'--time={_slurm_time(kwargs.get("sim_limit", 7200))}'
 
         mem = kwargs.get("mem", "4G")
         cpus_per_task = kwargs.get("cpus_per_task", 1)
