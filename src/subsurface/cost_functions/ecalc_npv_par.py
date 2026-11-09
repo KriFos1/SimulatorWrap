@@ -38,6 +38,11 @@ def ecalc_npv_par(pred_data, **kwargs):
     global sim_kwargs
     global sim_data
 
+    # The current PET passes the forecast as a DataFrame (report dates x data types, each cell the ensemble
+    # values), or a list of them for a multilevel forecast. Older PET versions passed a list over report
+    # times of (lists over levels of) dicts; convert to that layout and continue as before.
+    pred_data = _frames_to_pred_data(pred_data)
+
     # Get the necessary input
     keys_opt = kwargs.get('input_dict', {})
     report = kwargs.get('true_order', [])
@@ -124,6 +129,19 @@ def ecalc_npv_par(pred_data, **kwargs):
         objective[l] = np.array(objective[l]) / const.get('obj_scaling', 1)
 
     return objective
+
+def _frames_to_pred_data(pred_data):
+    """Forecast frames (one per level) as a list over report times of lists over levels of {DATATYPE: values}.
+    Anything that is not a DataFrame, or a list of DataFrames, is returned unchanged."""
+    frames = pred_data if isinstance(pred_data, list) else [pred_data]
+    if not frames or not all(isinstance(frame, pd.DataFrame) for frame in frames):
+        return pred_data
+    converted = []
+    for t in range(len(frames[0].index)):
+        converted.append([{str(col).upper(): np.atleast_1d(np.asarray(frame.iloc[t][col], dtype=float))
+                           for col in frame.columns} for frame in frames])
+    return converted
+
 
 def _safe_objective(nc):
     try:
