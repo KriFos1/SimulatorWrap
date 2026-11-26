@@ -8,7 +8,7 @@ Clone the repository and install it in editable mode by running
 python3 -m pip install -e .
 ```
 
-## PET LowRankGN: weighted JutulDarcy adjoints
+## JutulDarcy weighted adjoints for PET (LowRankGN and SVGD)
 
 Pass the existing `subsurface.multphaseflow.jutul_darcy.JutulDarcy(options)`
 to PET. Use a Mako `runfile`, `adjoint_mode="sensitivities"` (the default),
@@ -23,8 +23,16 @@ adjoint storage across the columns, and returns `{name: array(k, n)}` in
 the coordinates of each state field. There is no cross-call cache. The
 wrapper checks each weighted objective against the direct forward summary.
 
-Supported observations are scalar `WOPR`, `WWPR` and `WGPR` well rates in
-Sm³/day on exact report steps of a METRIC deck. Supported controls are
+For SVGD, set `weighted_adjoint={"parameters": ["log_permx"]}` instead.
+PET sets `sim.adjoint_weights` to a callable `(forward_frame, member_index)`
+returning one scalar weight per observed cell (missing weights are zero).
+`run_fwd_sim` returns `(output, gradient_series)` from that member's live
+trajectory, with no second forward solve. Match the gradient coordinate
+to the state: `permx` differentiates mD, `log_permx` its natural logarithm.
+
+Both entry points support METRIC well observations on report steps: `WOPR`,
+`WWPR`, `WGPR`, `WLPR`, `WWIR` (Sm³/day) and `WOPT`, `WWPT`, `WGPT`,
+`WLPT` (Sm³). The batched VJP's supported controls are
 direct `poro` (fraction), `permx`, `permy`, `permz` (mD) and `log_permx`
 etc. (natural log of mD). Use Cartesian deck order, full grid or processed
 active cells. The permeability gradient includes the wrapper's existing
@@ -33,9 +41,16 @@ independent axes or `True` for three identical copies when the deck fields
 alone are ambiguous. Inputs must render directly: clipping outside bounds,
 fault factors, and other template dependencies need their own chain rule.
 
-With the wrapper's Julia environment active, run
-`python -m pytest -q tests/test_jutul_vjp.py` for a two-objective,
-two-well directional check on the bundled TINY case.
+**Forward summary unit change:** field and well surface totals (including
+`WWIT` and `FLPT`) are now converted from SI volumes. Previously JutulDarcy
+0.3.11's METRIC/FIELD cumulative outputs were 86,400 times too large. Rates
+are reported per day for METRIC/FIELD, per hour for LAB, and per second for
+SI. Do not rescale PET observations or gradients to compensate for the old
+output. Recheck any prior workaround before comparing stored forecasts.
+
+With the wrapper's Julia environment active, run `python -m pytest -q
+tests/test_jutul_darcy.py tests/test_jutul_vjp.py` for both derivative
+paths, the directional finite difference and the SI-volume regression.
 
 ## Examples
 The example demonstrates usage of [OPM-flow](https://opm-project.org/). To reproduce, ensure that OPM-flow is installed and in the path. The full noteboox is [here](https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/tree/main/Example), we employ the [3Spot example](https://github.com/Python-Ensemble-Toolbox/Examples/tree/main/3Spot) as a template for this example. All files are Example folder.
