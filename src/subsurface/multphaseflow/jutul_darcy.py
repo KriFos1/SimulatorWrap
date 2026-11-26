@@ -34,10 +34,12 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 from mako.template import Template
 from p_tqdm import p_map
 from tqdm import tqdm
+from .vjp import scalar_seeds
 
 __author__ = ["Mathias Methlie Nilsen"] # With help from "Claude Opus 4.7"
 __all__ = ["JutulDarcy"]
@@ -237,6 +239,30 @@ function subsurface_adjoint_storage(case)
         state0 = case.state0,
         parameters = case.parameters
     )
+end
+
+function subsurface_rate_sum(seconds, wells, kinds, coefficients)
+    terms = Dict{Int, Vector{Tuple{Symbol, String, Float64}}}()
+    for (t, w, k, c) in zip(seconds, wells, kinds, coefficients)
+        iszero(c) && continue
+        push!(get!(terms, Int(t), Tuple{Symbol, String, Float64}[]),
+              (Symbol(string(w)), string(k), Float64(c)))
+    end
+    return function (model, state, dt, step_info, forces)
+        t = step_info[:time]
+        target = round(Int, t)
+        abs(t - target) <= 1e-5 && haskey(terms, target) || return 0.0
+        total = 0.0
+        controls = forces[:Facility].control
+        for (well, kind, c) in terms[target]
+            haskey(controls, well) || continue
+            controls[well] isa JutulDarcy.ProducerControl || continue
+            phase = kind == "WOPR" ? SurfaceOilRateTarget :
+                    kind == "WWPR" ? SurfaceWaterRateTarget : SurfaceGasRateTarget
+            total -= c * 86400 * JutulDarcy.compute_well_qoi(model, state, forces, well, phase)
+        end
+        return total
+    end
 end
 
 function subsurface_packed_step_times(packed)
@@ -1261,50 +1287,108 @@ class JutulDarcy:
         -------
         Same as :meth:`__call__` for a single member.
         """
+        folder = Path(f"En_{idn}")
+        folder.mkdir(exist_ok=False)
+        try:
+            return self._simulate(input, idn, folder)
+        finally:
+            if delete_folder and folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+
+    def run_vjp(self, state, weights):
+        """Return one PET-state gradient per weighted sum of metric production rates."""
+        if self.compute_adjoints or self.adjoint_mode != "sensitivities":
+            raise ValueError("Use sensitivities mode without ensemble 'adjoints' for PET VJPs")
+        cells, seeds = scalar_seeds(weights, self.report, self.datatype)
+        for _, key in cells:
+            kind, _, well = key.partition(":")
+            if not well or kind not in {"WOPR", "WWPR", "WGPR"}:
+                raise ValueError(f"Unsupported production rate: {key}")
+        valid = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
+        if not state or set(state) - valid or not self.makofile:
+            raise ValueError("VJP needs a Mako deck with direct porosity or (log-)permeability fields")
+        if len({name.removeprefix("log_") for name in state}) != len(state):
+            raise ValueError("Only one PET variable may control a deck field")
+        with TemporaryDirectory(prefix="vjp_", dir=".") as folder:
+            return self._simulate(dict(state), 0, Path(folder), (cells, seeds))
+
+    def _simulate(self, input, idn, folder, vjp=None):
         # Julia is imported lazily inside the worker so it picks up the
         # process-local thread/state. Importing at module scope would break
         # multiprocessing's fork/spawn semantics.
         from juliacall import Main as julia
-        julia.seval("using JutulDarcy, Jutul")
-        if self.compute_adjoints:
+        # Julia 1.11+ requires bindings to exist before PythonCall can assign them.
+        julia.seval("using JutulDarcy, Jutul; global case, res, grad_case, adj_packed, adj_storage, func")
+        if self.compute_adjoints or vjp is not None:
             _ensure_julia_helpers(julia)
 
-        folder = Path(f"En_{idn}")
-        folder.mkdir(exist_ok=False)
+        datafile = self._stage_input(input.copy() if isinstance(input, dict) else input, folder, idn)
+        with _chdir(folder):
+            case = self._setup_case(datafile, julia)
+            julia.case = case
+            units = self._detect_units(case, julia)
+            actnum_vec = self._extract_actnum(case, julia)
+            jlres = julia.simulate_reservoir(case, info_level=-1, output_substates=True)
+            julia.res = jlres
+            pyres = self.extract_datatypes(jlres, case, units, julia)
+            if vjp is not None:
+                if units != "metric":
+                    raise ValueError("Rate VJPs require a METRIC deck")
+                return self._rate_vjp(input, *vjp, case, jlres, pyres, actnum_vec, julia)
+            output = self._format_output(pyres)
+            if self.compute_adjoints:
+                return output, self._compute_adjoints(case, jlres, pyres, units, actnum_vec, idn, julia)
+            return output
 
-        try:
-            # Stage the deck (render template or copy file).
-            datafile = self._stage_input(input, folder, idn)
-
-            # All Julia file I/O must happen relative to the deck location.
-            with _chdir(folder):
-                case = self._setup_case(datafile, julia)
-                julia.case = case  # expose to Julia-side eval'd expressions
-
-                units = self._detect_units(case, julia)
-                actnum_vec = self._extract_actnum(case, julia)
-
-                # Forward solve. `output_substates=True` keeps intermediate
-                # states needed for adjoint reconstruction.
-                jlres = julia.simulate_reservoir(
-                    case, info_level=-1, output_substates=True
-                )
-                julia.res = jlres
-
-                pyres = self.extract_datatypes(jlres, case, units, julia)
-                output = self._format_output(pyres)
-
-                if self.compute_adjoints:
-                    adjoints = self._compute_adjoints(
-                        case, jlres, pyres, units, actnum_vec, idn, julia
-                    )
-                    return output, adjoints
-
-                return output
-        finally:
-            # Always clean up, even on failure, to keep the workspace tidy.
-            if delete_folder and folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
+    def _rate_vjp(self, state, cells, seeds, case, res, summary, actnum, jl):
+        active = actnum == 1
+        md = jl.seval("si_unit(:milli)*si_unit(:darcy)")
+        for name, x in state.items():
+            keyword = name.removeprefix("log_").upper()
+            field = np.asarray(case.input_data["GRID"][keyword]).ravel(order="F")[active]
+            if keyword != "PORO":
+                field = field / md
+            expected = np.exp(x) if name.startswith("log_") else np.asarray(x)
+            if expected.shape == active.shape:
+                expected = expected[active]
+            if (expected.shape != field.shape or not np.all(expected > 0)
+                    or not np.allclose(field, expected, rtol=3e-5, atol=0)):
+                raise ValueError(f"{name} must render directly in Cartesian order (check units and clipping)")
+        times = dict(zip(self.report, self.report_seconds))
+        seconds = [int(times[label]) for label, _ in cells]
+        kinds, wells = zip(*(key.split(":") for _, key in cells))
+        values = np.asarray([summary.at[label, key] for label, key in cells])
+        packed = jl.subsurface_adjoint_packed(case, res)
+        storage = jl.subsurface_adjoint_storage(case)
+        packed_times = np.asarray(jl.subsurface_packed_step_times(packed))
+        if any(np.count_nonzero(abs(packed_times - t) <= 1e-5) != 1 for t in set(seconds)):
+            raise ValueError("VJP requires one matching simulator step per report time")
+        jac, nc = _well_index_perm_jacobian(case, jl, self.well_index_from_perm) if any(
+            "perm" in name for name in state) else ({}, 0)
+        copied = (_detect_copied_perm_axes(case, actnum, self.perm_copied, jl)
+                  if any(k.endswith("permx") for k in state) else None)
+        if copied and any(name.endswith(axis) for axis, tied in zip(("permy", "permz"), copied.include[1:])
+                          if tied for name in state):
+            raise ValueError("A copied axis cannot also be an independent permeability control")
+        out = {name: np.zeros((seeds.shape[1], np.size(x))) for name, x in state.items()}
+        for j, column in enumerate(seeds.T):
+            if not column.any():
+                continue
+            obj = jl.subsurface_rate_sum(seconds, list(wells), list(kinds), column)
+            actual = jl.Jutul.evaluate_objective(obj, case, res.result)
+            if not np.isclose(actual, column @ values):
+                raise ValueError("Weighted adjoint objective differs from the forward summary")
+            sens = jl.subsurface_sensitivities_reuse(case, storage, packed, obj, len(packed_times))
+            wi = _well_index_chain_term(jac, sens.models, nc, jl) if jac else None
+            for name, x in state.items():
+                g = _extract_adjoint(sens.reservoir, case, name, actnum,
+                                     copied if name.endswith("permx") else None, jl, wi_chain_term=wi)
+                if np.size(x) != len(g):
+                    g = g[actnum == 1]
+                if g.shape != np.shape(x) or not np.isfinite(g).all():
+                    raise ValueError(f"Invalid adjoint shape or nonfinite values for {name}")
+                out[name][j] = g
+        return out
 
     # ---------------------------------------------------------------- #
     # Setup helpers

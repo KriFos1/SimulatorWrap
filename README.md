@@ -8,6 +8,35 @@ Clone the repository and install it in editable mode by running
 python3 -m pip install -e .
 ```
 
+## PET LowRankGN: weighted JutulDarcy adjoints
+
+Pass the existing `subsurface.multphaseflow.jutul_darcy.JutulDarcy(options)`
+to PET. Use a Mako `runfile`, `adjoint_mode="sensitivities"` (the default),
+and omit `adjoints`. Ordinary forecasts then return just predictions. The
+existing `adjoints` configuration remains available for standalone
+per-observation gradients.
+
+`run_vjp(state, weights)` accepts PET's report-by-datatype frame. An
+observed cell contains the k coefficients of that datum, a missing cell
+is `None`. It runs the centre once per call, shares its ministeps and
+adjoint storage across the columns, and returns `{name: array(k, n)}` in
+the coordinates of each state field. There is no cross-call cache. The
+wrapper checks each weighted objective against the direct forward summary.
+
+Supported observations are scalar `WOPR`, `WWPR` and `WGPR` well rates in
+Sm³/day on exact report steps of a METRIC deck. Supported controls are
+direct `poro` (fraction), `permx`, `permy`, `permz` (mD) and `log_permx`
+etc. (natural log of mD). Use Cartesian deck order, full grid or processed
+active cells. The permeability gradient includes the wrapper's existing
+well-index and copied-axis chain rules. Specify `perm_copied=False` for
+independent axes or `True` for three identical copies when the deck fields
+alone are ambiguous. Inputs must render directly: clipping outside bounds,
+fault factors, and other template dependencies need their own chain rule.
+
+With the wrapper's Julia environment active, run
+`python -m pytest -q tests/test_jutul_vjp.py` for a two-objective,
+two-well directional check on the bundled TINY case.
+
 ## Examples
 The example demonstrates usage of [OPM-flow](https://opm-project.org/). To reproduce, ensure that OPM-flow is installed and in the path. The full noteboox is [here](https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/tree/main/Example), we employ the [3Spot example](https://github.com/Python-Ensemble-Toolbox/Examples/tree/main/3Spot) as a template for this example. All files are Example folder.
 
