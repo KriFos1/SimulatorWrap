@@ -9,6 +9,46 @@ python3 -m pip install -e .
 ```
 
 ## Examples
+### PET LowRankGN: weighted Flow adjoints
+
+Use `subsurface.multphaseflow.opm_adjoint.FlowAdjoint(options)` in place of
+`flow(options)`. Give it the usual Flow options plus `adjoint_executable` (an
+absolute executable path or command on PATH; default `flow_adjoint`). Use the
+`adjoint-hooks` build of [opm-simulators](https://github.com/hnil/opm-simulators/tree/adjoint-hooks)
+and the [`linw` build of opm-adjoint](https://github.com/KriFos1/opm-adjoint/tree/feat/matchw-linw-objectives);
+stock Flow cannot replay weighted objectives. No Python dependency is added.
+
+After `setup_fwd_run()`, `run_vjp(state, weights)` renders the centre once,
+records a trajectory, and replays it serially for each nonzero seed column.
+`weights` is PET's report-by-datatype frame: each observed cell holds a
+length-k vector; `None` cells are skipped. Each returned `grad[name][j]` is
+the derivative of the j-th weighted summary with respect to `state[name]`.
+Forward members never record an archive. The temporary archive needs enough
+disk for all substeps and is removed after the batch.
+
+- Use scalar `WOPR`, `WWPR` or `WGPR` for **producing wells** in Sm³/day.
+  Supply exact midnight reports isolated from other substep ends by more
+  than six hours (`linw`'s date-matching window). The wrapper checks each
+  objective against the recorded summary. Turn off summary thinning.
+- Use serial METRIC decks writing `INIT`, with independent `poro` (fraction),
+  `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD).
+  One vector entry per active cell in Flow order. Direct fields must not
+  control any other property. For permeability, use **fixed connection
+  factors**: the backend differentiates face transmissibilities, not a
+  permeability-derived well index. Copied axes, fault multipliers, nonlinear
+  Mako transforms, changing active sets and multisegment wells are outside
+  this adapter. Do not change a model's wells just to make it pass.
+- The same executable and solver flags drive both predictions and adjoints.
+  Use converged forward tolerances and check a directional derivative when
+  moving to a new deck; matching objective values checks units and timing,
+  not the accuracy of the backend derivative.
+
+Run the identity- and mixed-seed directional derivative test with `FLOW_ADJOINT` pointing to
+the executable and `OPM_ADJOINT_CASE` to `MODEL_1D_DEBUG/inputfiles` from
+[`hnil/opm-tests`, `add_adjoint_tests`](https://github.com/hnil/opm-tests/tree/add_adjoint_tests):
+`python -m pytest -q tests/test_flow_vjp.py` (with PET on the Python path).
+
+### Forward Flow example
 The example demonstrates usage of [OPM-flow](https://opm-project.org/). To reproduce, ensure that OPM-flow is installed and in the path. The full noteboox is [here](https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/tree/main/Example), we employ the [3Spot example](https://github.com/Python-Ensemble-Toolbox/Examples/tree/main/3Spot) as a template for this example. All files are Example folder.
 
 
