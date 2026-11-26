@@ -13,10 +13,10 @@ python3 -m pip install -e .
 
 Use `subsurface.multphaseflow.opm_adjoint.FlowAdjoint(options)` in place of
 `flow(options)`. Give it the usual Flow options plus `adjoint_executable` (an
-absolute executable path or command on PATH; default `flow_adjoint`). Use the
-`adjoint-hooks` build of [opm-simulators](https://github.com/hnil/opm-simulators/tree/adjoint-hooks)
-and the [`linw` build of opm-adjoint](https://github.com/KriFos1/opm-adjoint/tree/feat/matchw-linw-objectives);
-stock Flow cannot replay weighted objectives. No Python dependency is added.
+absolute executable path or command on PATH; default `flow_adjoint`), the
+executable of [OPM/opm-adjoint](https://github.com/OPM/opm-adjoint) built
+against the official OPM modules. Stock `flow` has no adjoint. No Python
+dependency is added.
 
 After `setup_fwd_run()`, `run_vjp(state, weights)` renders the centre once,
 records a trajectory, and replays it serially for each nonzero seed column.
@@ -26,27 +26,38 @@ the derivative of the j-th weighted summary with respect to `state[name]`.
 Forward members never record an archive. The temporary archive needs enough
 disk for all substeps and is removed after the batch.
 
-- Use scalar `WOPR`, `WWPR` or `WGPR` for **producing wells** in Sm³/day.
-  Supply exact midnight reports isolated from other substep ends by more
-  than six hours (`linw`'s date-matching window). The wrapper checks each
+The weighted sums are handed to `flow_adjoint` as a JSON objective
+(`--adjoint-config`): one `rate` term per observed value, active on the
+substep that ends on its report. Gradients are read from the
+`ADJOINT_GRADIENTS_{PORO,PERM}.csv` files and their JSON sidecar. Each batch
+adds one objective-only replay, which fixes the substep lengths the terms
+need.
+
+- Use scalar `WOPR`, `WWPR` or `WGPR` for **producing wells** in Sm³/day. A
+  report may be any time a simulator step ends on; the wrapper checks the
   objective against the recorded summary. Turn off summary thinning.
 - Use serial METRIC decks writing `INIT`, with independent `poro` (fraction),
-  `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD).
-  One vector entry per active cell in Flow order. Direct fields must not
-  control any other property. For permeability, use **fixed connection
-  factors**: the backend differentiates face transmissibilities, not a
-  permeability-derived well index. Copied axes, fault multipliers, nonlinear
-  Mako transforms, changing active sets and multisegment wells are outside
-  this adapter. Do not change a model's wells just to make it pass.
+  `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD), one
+  value per active cell or per grid cell in natural order. The gradient has
+  the shape of the state; inactive cells get zero. Direct fields must not
+  control any other property: copied axes, fault multipliers and nonlinear
+  Mako transforms need their own chain rule.
+- Connection factors computed from the permeability and multisegment wells
+  are differentiated by opm-adjoint. Two cases need changes that are not in
+  its master yet:
+  [OPM/opm-adjoint#2](https://github.com/OPM/opm-adjoint/pull/2) for exact
+  gradients with producers on RESV control, and
+  [OPM/opm-adjoint#3](https://github.com/OPM/opm-adjoint/pull/3) for wells
+  that the schedule defines after the first report step.
 - The same executable and solver flags drive both predictions and adjoints.
   Use converged forward tolerances and check a directional derivative when
   moving to a new deck; matching objective values checks units and timing,
   not the accuracy of the backend derivative.
 
-Run the identity- and mixed-seed directional derivative test with `FLOW_ADJOINT` pointing to
-the executable and `OPM_ADJOINT_CASE` to `MODEL_1D_DEBUG/inputfiles` from
-[`hnil/opm-tests`, `add_adjoint_tests`](https://github.com/hnil/opm-tests/tree/add_adjoint_tests):
-`python -m pytest -q tests/test_flow_vjp.py` (with PET on the Python path).
+Run the directional derivative tests with `FLOW_ADJOINT` pointing to the
+executable and `OPM_ADJOINT_CASE` to `doc/tutorials/MODEL_1D_DEBUG` of
+opm-adjoint: `python -m pytest -q tests/test_flow_vjp.py` (with PET on the
+Python path).
 
 ### Forward Flow example
 The example demonstrates usage of [OPM-flow](https://opm-project.org/). To reproduce, ensure that OPM-flow is installed and in the path. The full noteboox is [here](https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/tree/main/Example), we employ the [3Spot example](https://github.com/Python-Ensemble-Toolbox/Examples/tree/main/3Spot) as a template for this example. All files are Example folder.
