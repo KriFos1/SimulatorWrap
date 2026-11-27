@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 from tempfile import TemporaryDirectory
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -14,14 +15,17 @@ from resdata.summary import Summary
 from resdata.resfile import ResdataFile
 
 from .opm import flow
-from .vjp import scalar_seeds
+from .vjp import finite_difference_check, scalar_seeds, weighted_sums
 
 PHASES = {"WOPR": "oil", "WWPR": "water", "WGPR": "gas"}
 FIELDS = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
+# INIT arrays Flow computes from a field; opm-adjoint carries their derivatives itself.
+DERIVED = {"PORO": {"PORV"}, "PERMX": {"TRANX", "TRANY", "TRANZ"}, "PERMY": {"TRANX", "TRANY", "TRANZ"},
+           "PERMZ": {"TRANX", "TRANY", "TRANZ"}}
+HEADERS = {"INTEHEAD", "LOGIHEAD", "DOUBHEAD"}
 # Flags the wrapper sets itself; the adjoint's solver settings (--adjoint-linear-solver...) remain the user's.
 OWNED_FLAGS = ("--adjoint-file", "--adjoint-save", "--adjoint-mode", "--adjoint-config", "--adjoint-objective",
                "--output-dir", "--enable-storage-cache")
-
 
 
 class FlowAdjoint(flow):
@@ -37,6 +41,7 @@ class FlowAdjoint(flow):
             raise ValueError("FlowAdjoint owns the archive, mode, objective, output and storage-cache flags")
         if self.options["parsing-strictness"]:
             self.flags.append("--parsing-strictness=" + self.options["parsing-strictness"])
+        self.chain_rule = None  # the report of check_chain_rule, once it has run
 
     def _flow(self, deck, output, *flags):
         output.mkdir(exist_ok=True)
@@ -68,6 +73,8 @@ class FlowAdjoint(flow):
             kind, _, well = key.partition(":")
             if kind.upper() not in PHASES or not re.fullmatch(r"[\w.-]+", well):
                 raise ValueError(f"Unsupported production rate: {key}")
+        if self.chain_rule is None or set(self.chain_rule["ties"]) != set(state):
+            self.check_chain_rule(state)
         gradients = {key: np.zeros((seeds.shape[1], np.size(x))) for key, x in state.items()}
         with TemporaryDirectory(prefix="vjp_", dir=".") as tmp:
             root = Path(tmp).resolve()
@@ -154,7 +161,11 @@ class FlowAdjoint(flow):
                     if (expected.shape != deck_fields[name].shape or not np.all(expected > 0)
                             or not np.allclose(deck_fields[name], expected, rtol=2e-5, atol=0)):
                         raise ValueError(f"{name} must render directly in grid order (check units and clipping)")
-                    g = poro / expected if name == "poro" else perm[:, "xyz".index(name[-1])]
+                    if name == "poro":
+                        g = poro / expected
+                    else:  # the deck may tie other axes to this one: PERMb = factor * PERMa
+                        g = perm[:, "xyz".index(name[-1])] + sum(
+                            factor * perm[:, "xyz".index(axis)] for axis, factor in self.chain_rule["ties"][name].items())
                     if name.startswith("log_"):
                         g = g * expected
                     if not np.isfinite(g).all():
@@ -175,3 +186,152 @@ class FlowAdjoint(flow):
         if len(values) != len(terms):
             raise RuntimeError("Could not read the objective terms from the flow_adjoint log")
         return np.array(values, dtype=float)
+
+    # ------------------------------------------------------------------
+    # Does the derivative resolve every term of the chain rule?
+    # ------------------------------------------------------------------
+    def check_chain_rule(self, state, weights=None, step=1e-2, rtol=0.05, seed=0):
+        """Find everything in the deck that moves with ``state``, and say whether ``run_vjp`` differentiates it.
+
+        Each state variable is perturbed, the deck rendered again and read by Flow without simulating. The
+        rendered text may differ only inside the keyword of the variable's own field, and the grid arrays Flow
+        reports only in that field, in what Flow derives from it, and in permeability axes the deck ties to it
+        by a constant factor (``COPY``/``MULTIPLY``), which ``run_vjp`` then adds. Anything else is a term the
+        derivative lacks, and raises. Connection factors left for Flow to compute from the permeability are
+        listed as ``approximate``: opm-adjoint keeps their leading term.
+
+        With ``weights`` (as for ``run_vjp``) the gradients are also compared with central differences of the
+        weighted sums through template and simulator: the check of the whole chain, at four simulations per
+        variable and direction. A mismatch raises; the rows are in the returned report.
+        """
+        if not state or set(state) - FIELDS:
+            raise ValueError(f"Expected direct cell fields from {sorted(FIELDS)}, got {list(state)}")
+        rng = np.random.default_rng(seed)
+        report = {"ties": {}, "derived": {}, "approximate": [], "unresolved": [], "finite_difference": []}
+        base_text, base, _, wells = self._dry_run(state)
+        if wells and any(name != "poro" for name in state):
+            report["approximate"].append(
+                f"connection factors of {wells} follow the permeability; opm-adjoint differentiates the "
+                "leading (Kh) term only")
+        for name, x in state.items():
+            x = np.asarray(x, dtype=float)
+            target = name.removeprefix("log_").upper()
+            sign = rng.choice([-1.0, 1.0], size=x.shape)
+            moved = x + 1e-3 * sign if name.startswith("log_") else x * (1 + 1e-3 * sign)
+            text, arrays, cells, _ = self._dry_run({**state, name: moved})
+            lines, base_lines = text.splitlines(), base_text.splitlines()
+            if len(lines) != len(base_lines):
+                report["unresolved"].append(f"{name} changes the layout of the rendered deck")
+            else:
+                keywords = _keyword_of_lines(base_lines)
+                touched = {keywords[i] for i, (a, b) in enumerate(zip(lines, base_lines)) if a != b}
+                for keyword in sorted(touched - {target}):
+                    report["unresolved"].append(f"the template writes {keyword} from {name}")
+            changed = {key for key in base if key not in arrays or not np.array_equal(arrays[key], base[key])}
+            if target not in changed:
+                report["unresolved"].append(f"{name} does not reach {target} in the deck Flow reads")
+                continue
+            active = arrays[target] != base[target]
+            expected = np.exp(moved) if name.startswith("log_") else moved
+            if expected.size != base[target].size:  # one value per grid cell
+                expected = expected[cells]
+            if not np.allclose(arrays[target], expected, rtol=2e-5, atol=0):
+                report["unresolved"].append(
+                    f"{target} is not {name} itself in {int(np.sum(~np.isclose(arrays[target], expected, rtol=2e-5, atol=0)))} "
+                    "cells (clipping or another transform)")
+            ties = {}
+            for axis in "xyz":
+                other = "PERM" + axis.upper()
+                if target.startswith("PERM") and other != target and other in changed:
+                    factor = float(np.median(base[other][active] / base[target][active]))
+                    tied = all(np.allclose(a[other], factor * a[target], rtol=1e-5, atol=0) for a in (base, arrays))
+                    if tied and not {other.lower(), "log_" + other.lower()} & set(state):
+                        ties[axis] = factor
+                    else:
+                        report["unresolved"].append(f"{other} follows {name}, but not by a constant factor of its own")
+            report["ties"][name] = ties
+            allowed = {target} | DERIVED[target] | {"PERM" + axis.upper() for axis in ties}
+            report["derived"][name] = sorted(changed & (allowed - {target}))
+            for key in sorted(changed - allowed):
+                report["unresolved"].append(f"{key} follows {name}")
+        if report["unresolved"]:
+            raise ValueError("run_vjp would miss part of the chain rule: " + "; ".join(report["unresolved"]))
+        for note in report["approximate"]:
+            warnings.warn(note, stacklevel=2)
+        self.chain_rule = report
+        if weights is not None:
+            cells, seeds = scalar_seeds(weights, self.true_order[1], self.all_data_types)
+            member = iter(range(10**6))
+
+            def forward(x):
+                records = self.run_fwd_sim({key: np.array(value, dtype=float) for key, value in x.items()}, next(member))
+                return weighted_sums(records, self.true_order[1], cells, seeds)
+
+            gradients = self.run_vjp({key: np.array(value, dtype=float) for key, value in state.items()}, weights)
+            report["finite_difference"] = finite_difference_check(forward, gradients, state, forward(state), step, rtol, seed)
+            failed = [row for row in report["finite_difference"] if row["ok"] is False]
+            if failed:
+                raise ValueError(f"Gradients differ from finite differences beyond {rtol:g}: {failed[:4]}")
+            if any(row["ok"] is None for row in report["finite_difference"]):
+                warnings.warn("The finite differences change too much with the step to judge some gradients: the "
+                              "simulated rates are not smooth in the state. Tighten the solver tolerances or fix "
+                              "the time steps (rows with ok=None in the report).", stacklevel=2)
+        return report
+
+    def _dry_run(self, state):
+        """Render ``state`` and let Flow read the deck without simulating.
+
+        Returns the deck text, its INIT arrays, the active cells, and the wells whose connection factors Flow
+        computes from the permeability. The deck sits where a member's deck does, so relative includes resolve.
+        """
+        with TemporaryDirectory(prefix="audit_", dir=".") as tmp:
+            folder = Path(tmp).resolve()
+            self._runMako(str(folder) + "/", dict({key: np.array(value, dtype=float) for key, value in state.items()},
+                                                  member=0, level=self.level))
+            deck = folder / (self.file + ".DATA")
+            self._flow(deck, folder, "--enable-dry-run=true")
+            with closing(ResdataFile(str(folder / (self.file + ".INIT")))) as init:
+                arrays = {key: np.asarray(init[key][0]).copy() for key in dict.fromkeys(init.keys()) if key not in HEADERS}
+            with closing(ResdataFile(str(folder / (self.file + ".EGRID")))) as grid:
+                cells = np.asarray(grid["ACTNUM"][0]) != 0 if grid.has_kw("ACTNUM") else slice(None)
+            return deck.read_text(), arrays, cells, _connection_factors_from_permeability(deck)
+
+
+def _keyword_of_lines(lines):
+    """The deck keyword each line belongs to."""
+    current, out = "", []
+    for line in lines:
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{1,7}", line.strip()):
+            current = line.strip()
+        out.append(current)
+    return out
+
+
+def _connection_factors_from_permeability(deck):
+    """Wells with a COMPDAT connection whose transmissibility factor (item 8) and Kh (item 10) are both defaulted."""
+    wells, seen = set(), set()
+
+    def scan(path):
+        if path in seen or not path.is_file():
+            return
+        seen.add(path)
+        keyword = ""
+        text = re.sub(r"--.*", "", path.read_text(errors="replace"))
+        for include in re.findall(r"(?m)^\s*INCLUDE\s*\n\s*'?([^'/\s][^'\n]*?)'?\s*/", text):
+            scan((path.parent / include.strip()).resolve())
+        for line in text.splitlines():
+            stripped = line.strip()
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{1,7}", stripped):
+                keyword = stripped
+            elif keyword in ("COMPDAT", "COMPDATL") and stripped and stripped != "/":
+                items = []
+                for token in stripped.split("/")[0].split():
+                    repeat = re.fullmatch(r"(\d+)\*", token)
+                    items += ["*"] * int(repeat[1]) if repeat else [token]
+                items += ["*"] * (14 - len(items))
+                offset = 1 if keyword == "COMPDATL" else 0
+                if items[7 + offset] == "*" and items[9 + offset] == "*":
+                    wells.add(items[0].strip("'"))
+
+    scan(Path(deck).resolve())
+    return sorted(wells)

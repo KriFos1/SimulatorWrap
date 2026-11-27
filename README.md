@@ -39,9 +39,12 @@ need.
 - Use serial METRIC decks writing `INIT`, with independent `poro` (fraction),
   `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD), one
   value per active cell or per grid cell in natural order. The gradient has
-  the shape of the state; inactive cells get zero. Direct fields must not
-  control any other property: copied axes, fault multipliers and nonlinear
-  Mako transforms need their own chain rule.
+  the shape of the state; inactive cells get zero. A permeability axis the
+  deck ties to the variable's field by a constant factor (`COPY`, `MULTIPLY`)
+  is found and added to its gradient. Anything else that moves with the
+  state is refused: another keyword the template writes from it, a clipped
+  or otherwise transformed field, an array Flow derives from it that
+  opm-adjoint does not differentiate.
 - Connection factors computed from the permeability and multisegment wells
   are differentiated by opm-adjoint. Two cases need changes that are not in
   its master yet:
@@ -54,8 +57,27 @@ need.
   go in `sim_flag` with the others; the wrapper sets the archive, mode,
   objective and output flags itself and refuses them there.
   Use converged forward tolerances and check a directional derivative when
-  moving to a new deck; matching objective values checks units and timing,
-  not the accuracy of the backend derivative.
+  moving to a new deck (below); matching objective values checks units and
+  timing, not the accuracy of the backend derivative.
+
+`check_chain_rule(state, weights=None)` tells whether the derivative resolves
+every term of the chain rule from the state to the weighted sums. It perturbs
+each variable, renders the deck again and lets Flow read it without
+simulating, then compares the rendered text and Flow's `INIT` arrays with the
+unperturbed ones. `run_vjp` runs this part itself before its first batch, and
+raises on a term it would miss. The returned report lists the tied axes
+(`ties`), the arrays Flow derives (`derived`) and what opm-adjoint
+differentiates approximately (`approximate`: connection factors left for Flow
+to compute from the permeability, of which it keeps the Kh term).
+
+With `weights`, the gradients are also compared with central differences of
+the weighted sums along an alternating and a uniform direction, at two step
+sizes: four simulations per variable and direction. This is the check that
+reaches dependencies inside Flow which its `INIT` arrays do not show. A
+mismatch raises. A row with `ok = None` could not be judged because the
+finite differences change too much with the step: the simulated rates are
+not smooth in the state, which adaptive time stepping and loose solver
+tolerances cause; fixed steps and tight tolerances make it conclusive.
 
 Run the directional derivative tests with `FLOW_ADJOINT` pointing to the
 executable and `OPM_ADJOINT_CASE` to `doc/tutorials/MODEL_1D_DEBUG` of
