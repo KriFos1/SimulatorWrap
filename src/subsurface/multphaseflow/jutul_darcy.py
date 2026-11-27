@@ -43,7 +43,7 @@ from typing import Any, Iterable
 from mako.template import Template
 from multiprocess import get_context
 from tqdm import tqdm
-from .vjp import scalar_seeds
+from .vjp import finite_difference_check, keywords_changed, scalar_seeds, weighted_sums
 
 __author__ = ["Mathias Methlie Nilsen"] # With help from "Claude Opus 4.7"
 __all__ = ["JutulDarcy"]
@@ -174,6 +174,11 @@ STEP_TIME_TOL: float = 0.5
 #:     objective that only fires at report step k has zero adjoint contribution
 #:     from every later step, so sweeping them is wasted work.
 #:
+#: ``subsurface_case_arrays``
+#:     Every numeric array of a case that a deck field can reach: the data
+#:     domains, the parameters and the initial state of all its models, by
+#:     ``section/model/name``. `check_chain_rule` compares two cases with it.
+#:
 #: ``subsurface_weighted_well_objective``
 #:     ``sum_i w_i * d_i`` over well data ``d_i`` as one sum objective, so its
 #:     gradient is ``H^T w`` from a single adjoint solve. Entries sharing a well
@@ -300,6 +305,25 @@ function subsurface_sensitivities_reuse(case, storage, packed, obj, n_steps)
         grad[k, Jutul.associated_entity(pdef)] = rsens[k]
     end
     return (reservoir = grad, models = sens)
+end
+
+function subsurface_case_arrays(case)
+    out = Dict{String, Array{Float64}}()
+    put(key, v) = (v isa AbstractArray{<:Real} && !isempty(v)) ? (out[key] = Float64.(collect(v)); nothing) : nothing
+    walk(prefix, d) = for (k, v) in pairs(d)
+        (v isa AbstractDict || v isa NamedTuple) ? walk("$prefix/$k", v) : put("$prefix/$k", v)
+    end
+    model = case.model
+    models = model isa Jutul.MultiModel ? pairs(model.models) : [:Reservoir => model]
+    for (name, m) in models
+        dd = m.data_domain
+        for k in keys(dd)
+            put("domain/$name/$k", dd[k])
+        end
+    end
+    walk("parameters", model isa Jutul.MultiModel ? case.parameters : Dict(:Reservoir => case.parameters))
+    walk("state0", model isa Jutul.MultiModel ? case.state0 : Dict(:Reservoir => case.state0))
+    return out
 end
 
 function subsurface_weighted_well_objective(wells, targets, is_rate, injectors, times, weights, tol)
@@ -1263,6 +1287,7 @@ class JutulDarcy:
         # framework; we keep them as direct passthroughs.
         self.input_dict = options
         self.true_order = self.index
+        self.chain_rule = None  # the report of check_chain_rule, once it has run
 
     # ---------------------------------------------------------------- #
     # Public entry point
@@ -1352,16 +1377,164 @@ class JutulDarcy:
 
     def run_vjp(self, state, weights):
         """Return one PET-state gradient per weighted sum of METRIC well observations."""
+        self._check_vjp_state(state)
+        cells, seeds = scalar_seeds(weights, self.report, self.datatype)
+        if self.chain_rule is None or set(self.chain_rule["ties"]) != set(state):
+            self.check_chain_rule(state)
+        with TemporaryDirectory(prefix="vjp_", dir=".") as folder:
+            return self._simulate(dict(state), 0, Path(folder), (cells, seeds))
+
+    def _check_vjp_state(self, state):
         if self.compute_adjoints or self.adjoint_mode != "sensitivities":
             raise ValueError("Use sensitivities mode without ensemble 'adjoints' for PET VJPs")
-        cells, seeds = scalar_seeds(weights, self.report, self.datatype)
         valid = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
         if not state or set(state) - valid or not self.makofile:
             raise ValueError("VJP needs a Mako deck with direct porosity or (log-)permeability fields")
         if len({name.removeprefix("log_") for name in state}) != len(state):
             raise ValueError("Only one PET variable may control a deck field")
-        with TemporaryDirectory(prefix="vjp_", dir=".") as folder:
-            return self._simulate(dict(state), 0, Path(folder), (cells, seeds))
+
+    # ---------------------------------------------------------------- #
+    # Does the derivative resolve every term of the chain rule?
+    # ---------------------------------------------------------------- #
+    def check_chain_rule(self, state, weights=None, step=1e-2, rtol=0.05, seed=0):
+        """Find everything in the case that moves with ``state``, and say whether ``run_vjp`` differentiates it.
+
+        Each state variable is perturbed, the deck rendered again and set up by JutulDarcy without simulating.
+        The rendered text may differ only inside the keyword of the variable's own field. Of the case, only
+        that field may move, the reservoir parameters JutulDarcy computes from it, the permeability axes the
+        wrapper adds for a deck ``COPY`` (``perm_copied``) and the well indices it differentiates
+        (``well_index_from_perm``). Anything else is a term the derivative lacks, and raises; so does a term
+        the wrapper adds for an axis or a well index that does not move.
+
+        With ``weights`` (as for ``run_vjp``) the gradients are also compared with central differences of the
+        weighted sums through template and simulator: the check of the whole chain, at four simulations per
+        variable and direction. A mismatch raises; the rows are in the returned report.
+        """
+        self._check_vjp_state(state)
+        from juliacall import Main as julia
+        julia.seval("using JutulDarcy, Jutul")
+        _ensure_julia_helpers(julia)
+        rng = np.random.default_rng(seed)
+        report = {"ties": {}, "derived": {}, "approximate": [], "unresolved": [], "finite_difference": []}
+        # What the wrapper adds is decided at the state itself, as run_vjp will decide it
+        base_text, base, wells, copied = self._set_up(state, julia)
+        for name, x in state.items():
+            x = np.asarray(x, dtype=float)
+            target = name.removeprefix("log_").upper()
+            sign = rng.choice([-1.0, 1.0], size=x.shape)
+            moved = x + 1e-3 * sign if name.startswith("log_") else x * (1 + 1e-3 * sign)
+            report["ties"][name] = ties = {}
+            try:
+                text, arrays, _, _ = self._set_up({**state, name: moved}, julia)
+            except ValueError as error:  # the deck does not hold the perturbed state itself
+                report["unresolved"].append(str(error))
+                continue
+            touched = keywords_changed(base_text, text)
+            if touched is None:
+                report["unresolved"].append(f"{name} changes the layout of the rendered deck")
+            else:
+                for keyword in sorted(touched - {target}):
+                    report["unresolved"].append(f"the template writes {keyword} from {name}")
+            changed = {key for key in base.keys() | arrays.keys() if key not in base or key not in arrays
+                       or base[key].shape != arrays[key].shape or not np.array_equal(base[key], arrays[key], equal_nan=True)}
+            field = "domain/Reservoir/" + ("porosity" if target == "PORO" else "permeability")
+            if field not in changed:
+                report["unresolved"].append(f"{name} does not reach the {field.rsplit('/', 1)[1]} of the case")
+                continue
+            axes = []  # the permeability axes whose sensitivities make up the gradient of this variable
+            if target != "PORO":
+                before, after = np.atleast_2d(base[field]), np.atleast_2d(arrays[field])
+                own = "XYZ".index(target[-1])
+                if own >= len(before):
+                    report["unresolved"].append(f"the case holds one permeability per cell, not {target}")
+                    continue
+                added = copied.include if copied is not None and name.endswith("permx") else np.arange(3) == own
+                axes = [axis for axis in range(len(before)) if added[axis]]
+                for axis in range(len(before)):
+                    if axis == own:
+                        continue
+                    other = "PERM" + "XYZ"[axis]
+                    if np.array_equal(before[axis], after[axis]):
+                        if added[axis]:
+                            report["unresolved"].append(
+                                f"the wrapper adds {other} to the gradient of {name}, which it does not follow (perm_copied)")
+                        continue
+                    factor = float(np.median(before[axis] / before[own]))
+                    if not all(np.allclose(k[axis], factor * k[own], rtol=1e-9, atol=0) for k in (before, after)):
+                        report["unresolved"].append(f"{other} follows {name}, but not by a constant factor")
+                    elif {other.lower(), "log_" + other.lower()} & set(state):
+                        report["unresolved"].append(f"{other} follows {name} and is a state variable of its own")
+                    elif not added[axis] or not np.isclose(copied.ratio[axis], factor, rtol=1e-6, atol=0):
+                        report["unresolved"].append(
+                            f"{other} follows {name} by the factor {factor:g}, which the wrapper does not add (perm_copied)")
+                    else:
+                        ties["xyz"[axis]] = factor
+            derived = set()
+            for key in sorted(changed - {field}):
+                section, model, quantity = key.split("/", 2)
+                if (section, model) == ("parameters", "Reservoir"):
+                    derived.add(quantity)  # JutulDarcy differentiates its reservoir parameters to the domain
+                elif axes and model != "Reservoir" and (section, quantity) in (
+                        ("domain", "permeability"), ("domain", "well_index"), ("parameters", "WellIndices")):
+                    continue  # the well indices are judged per connection below
+                else:
+                    report["unresolved"].append(f"{key} follows {name}")
+            for key in sorted(base if axes else ()):
+                section, well, quantity = key.split("/", 2)
+                if (section, quantity) != ("parameters", "WellIndices") or key not in arrays:
+                    continue
+                follows = base[key] != arrays[key]
+                differentiated = np.zeros(follows.shape, dtype=bool)
+                if well in wells:  # a term is added where the index depends on an axis of this variable
+                    differentiated[wells[well]["keep"]] = np.abs(wells[well]["dWI_dK"][axes]).sum(axis=0) > 0
+                for mask, message in (
+                        (follows & ~differentiated, "follows {name}, which the wrapper does not differentiate"),
+                        (differentiated & ~follows, "is differentiated by the wrapper, but does not follow {name}")):
+                    if mask.any():
+                        report["unresolved"].append(f"the well index of {int(mask.sum())} connection(s) of {well} "
+                                                    + message.format(name=name) + " (well_index_from_perm)")
+                if (follows & differentiated).any():
+                    derived.add("WellIndices")
+            report["derived"][name] = sorted(derived)
+        if report["unresolved"]:
+            raise ValueError("run_vjp would miss part of the chain rule: " + "; ".join(report["unresolved"]))
+        self.chain_rule = report
+        if weights is not None:
+            cells, seeds = scalar_seeds(weights, self.report, self.datatype)
+
+            def forward(x):
+                with TemporaryDirectory(prefix="audit_", dir=".") as folder:
+                    output = self._simulate({key: np.array(value, dtype=float) for key, value in x.items()}, 0, Path(folder))
+                return weighted_sums(pd.DataFrame(output, index=self.report), self.report, cells, seeds)
+
+            gradients = self.run_vjp({key: np.array(value, dtype=float) for key, value in state.items()}, weights)
+            report["finite_difference"] = finite_difference_check(forward, gradients, state, forward(state), step, rtol, seed)
+            failed = [row for row in report["finite_difference"] if row["ok"] is False]
+            if failed:
+                raise ValueError(f"Gradients differ from finite differences beyond {rtol:g}: {failed[:4]}")
+            if any(row["ok"] is None for row in report["finite_difference"]):
+                warnings.warn("The finite differences change too much with the step to judge some gradients: the "
+                              "simulated data are not smooth in the state. Tighten the solver tolerances or fix "
+                              "the time steps (rows with ok=None in the report).", stacklevel=2)
+        return report
+
+    def _set_up(self, state, julia):
+        """Render ``state`` and set the case up without simulating.
+
+        Returns the deck text, the arrays of the case by ``section/model/name``, and what the wrapper adds to
+        a permeability gradient: the well-index Jacobians and the copied axes.
+        """
+        state = {key: np.array(value, dtype=float) for key, value in state.items()}
+        with TemporaryDirectory(prefix="audit_", dir=".") as folder:
+            datafile = self._stage_input(dict(state), Path(folder), 0)
+            text = (Path(folder) / datafile).read_text()
+            with _chdir(folder):
+                case = self._setup_case(datafile, julia)
+            actnum = self._extract_actnum(case, julia)
+            self._validate_vjp_state(state, case, actnum, julia)
+            arrays = {str(key): np.array(value) for key, value in julia.subsurface_case_arrays(case).items()}
+            wells, _, copied = self._perm_gradient_context(case, actnum, list(state), julia)
+        return text, arrays, wells, copied
 
     def _simulate(self, input, idn, folder, vjp=None):
         # Julia is imported lazily inside the worker so it picks up the

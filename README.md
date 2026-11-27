@@ -41,6 +41,25 @@ independent axes or `True` for three identical copies when the deck fields
 alone are ambiguous. Inputs must render directly: clipping outside bounds,
 fault factors, and other template dependencies need their own chain rule.
 
+`check_chain_rule(state, weights=None)` tells whether the derivative resolves
+every term of the chain rule from the state to the weighted sums. It perturbs
+each variable, renders the deck again and lets JutulDarcy set the case up
+without simulating, then compares the rendered text and the arrays of the two
+cases: data domains, parameters and initial state of every model. Only the
+variable's own field may move, the reservoir parameters JutulDarcy computes
+from it, the axes `perm_copied` adds and the well indices
+`well_index_from_perm` differentiates. `run_vjp` runs this part itself before
+its first batch. It raises on a term it would miss, and on a term the options
+add for an axis or a well index that does not move; this settles the cases the
+detection from the deck fields cannot, such as a uniform `PERMX`. The returned
+report lists the tied axes (`ties`) and the derived parameters (`derived`).
+
+With `weights`, the gradients are also compared with central differences of
+the weighted sums along an alternating and a uniform direction, at two step
+sizes: four simulations per variable and direction. A mismatch raises. A row
+with `ok = None` could not be judged because the finite differences change
+too much with the step.
+
 **Forward summary unit change:** field and well surface totals (including
 `WWIT` and `FLPT`) are now converted from SI volumes. Previously JutulDarcy
 0.3.11's METRIC/FIELD cumulative outputs were 86,400 times too large. Rates
