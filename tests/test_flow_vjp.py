@@ -59,12 +59,14 @@ def test_the_solver_of_the_adjoint_is_the_users_choice_and_the_run_mode_is_not()
 PERMX = "PERMX\n${' '.join(map(str, permx))} /"
 
 
-def tutorial_template(steps=(2, 4), flags="--enable-adaptive-time-stepping=false", **blocks):
+def tutorial_template(steps=(2, 4), flags="--enable-adaptive-time-stepping=false", report_steps_only=False, **blocks):
     """The tutorial deck as a Mako template, with the given keyword blocks replaced."""
     source = Path(os.environ["OPM_ADJOINT_CASE"]).resolve()
     deck = (source / "MODEL_1D_DEBUG.DATA").read_text()
     deck = re.sub(r"INCLUDE\s+(\w+\.txt)\s*/", lambda m: (source / m[1]).read_text(), deck)
     deck = re.sub(r"(?ms)^TSTEP\s.*?/", f"TSTEP\n {steps[0]} {steps[1] - steps[0]} /", deck)
+    if report_steps_only:
+        deck = deck.replace("SUMMARY\n", "SUMMARY\nRPTONLY\n", 1)
     for keyword, block in blocks.items():
         deck = re.sub(rf"(?ms)^{keyword}\s.*?/", lambda _: block, deck)
     Path("TEST.mako").write_text(deck)
@@ -102,3 +104,14 @@ def test_defaulted_connection_factors_are_found_through_includes(tmp_path):
                                         " 'P3' 3 1 1 1 OPEN 2* 0.25 120.0 /\n/\n")
     (tmp_path / "CASE.DATA").write_text("SCHEDULE\nINCLUDE\n 'wells.inc' /\n")
     assert _connection_factors_from_permeability(tmp_path / "CASE.DATA") == ["P1"]
+
+
+@pytest.mark.skipif(not os.environ.get("OPM_ADJOINT_CASE"), reason="requires flow_adjoint and its tutorial deck")
+def test_a_deck_that_reports_the_summary_at_report_steps_only_gives_the_same_gradient(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gradients = []
+    for report_steps_only in (False, True):  # adaptive steps: several substeps per report
+        sim, weights = tutorial_template((40, 80), "", report_steps_only, PERMX=PERMX)
+        gradients.append(sim.run_vjp({"permx": np.full(3, 100.)}, weights)["permx"])
+    assert np.abs(gradients[0]).max() > 0
+    np.testing.assert_allclose(gradients[1], gradients[0], rtol=1e-9)

@@ -80,6 +80,8 @@ class FlowAdjoint(flow):
             root = Path(tmp).resolve()
             self._runMako(str(root) + "/", dict(state, member=0, level=self.level))
             deck = root / (self.file + ".DATA")
+            # The substep lengths come from the summary, which RPTONLY would thin to the report steps
+            deck.write_text(re.sub(r"(?m)^[ \t]*RPTONLY[ \t]*$", "-- RPTONLY", deck.read_text()))
             archive = f"--adjoint-file={root / 'archive'}"
             self._flow(deck, root, archive, "--adjoint-save=true")
             summary = Summary(str(root / self.file))

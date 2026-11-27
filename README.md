@@ -35,7 +35,8 @@ need.
 
 - Use scalar `WOPR`, `WWPR` or `WGPR` for **producing wells** in Sm³/day. A
   report may be any time a simulator step ends on; the wrapper checks the
-  objective against the recorded summary. Turn off summary thinning.
+  objective against the recorded summary, which must hold every simulator
+  step: `RPTONLY` in the deck is switched off for the recorded run.
 - Use serial METRIC decks writing `INIT`, with independent `poro` (fraction),
   `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD), one
   value per active cell or per grid cell in natural order. The gradient has
