@@ -46,3 +46,11 @@ def test_weighted_producer_rate_matches_forward_directional_difference(tmp_path,
     fd = (forward(x, p + delta*d) - forward(x, p - delta*d)) / (2*delta)
     assert np.linalg.norm(fd) > 1e-5
     np.testing.assert_allclose(g["poro"] @ d, fd, rtol=.02, atol=1e-5)
+
+
+def test_the_solver_of_the_adjoint_is_the_users_choice_and_the_run_mode_is_not():
+    options = {"runfile": "TEST", "datatype": ["wopr:prod"], "reporttype": "days", "reportpoint": [2, 4]}
+    sim = FlowAdjoint({**options, "simoptions": {"sim_flag": "--adjoint-linear-solver=umfpack"}})
+    assert "--adjoint-linear-solver=umfpack" in sim.flags
+    with pytest.raises(ValueError, match="FlowAdjoint owns"):
+        FlowAdjoint({**options, "simoptions": {"sim_flag": "--adjoint-mode=gradient"}})

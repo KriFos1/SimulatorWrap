@@ -50,6 +50,9 @@ need.
   [OPM/opm-adjoint#3](https://github.com/OPM/opm-adjoint/pull/3) for wells
   that the schedule defines after the first report step.
 - The same executable and solver flags drive both predictions and adjoints.
+  opm-adjoint's own solver flags, such as `--adjoint-linear-solver=umfpack`,
+  go in `sim_flag` with the others; the wrapper sets the archive, mode,
+  objective and output flags itself and refuses them there.
   Use converged forward tolerances and check a directional derivative when
   moving to a new deck; matching objective values checks units and timing,
   not the accuracy of the backend derivative.

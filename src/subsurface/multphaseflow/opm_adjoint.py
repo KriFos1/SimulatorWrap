@@ -18,6 +18,10 @@ from .vjp import scalar_seeds
 
 PHASES = {"WOPR": "oil", "WWPR": "water", "WGPR": "gas"}
 FIELDS = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
+# Flags the wrapper sets itself; the adjoint's solver settings (--adjoint-linear-solver...) remain the user's.
+OWNED_FLAGS = ("--adjoint-file", "--adjoint-save", "--adjoint-mode", "--adjoint-config", "--adjoint-objective",
+               "--output-dir", "--enable-storage-cache")
+
 
 
 class FlowAdjoint(flow):
@@ -29,8 +33,8 @@ class FlowAdjoint(flow):
         if self.options["mpi"] or self.options["mpiarray"] or input_file.get("hpc") or self.upscale:
             raise ValueError("FlowAdjoint supports serial, non-upscaled decks only")
         self.flags = shlex.split(self.options["sim_flag"])
-        if any(f.startswith(("--adjoint-", "--output-dir", "--enable-storage-cache")) for f in self.flags):
-            raise ValueError("FlowAdjoint owns archive, output and storage-cache flags")
+        if any(f.startswith(OWNED_FLAGS) for f in self.flags):
+            raise ValueError("FlowAdjoint owns the archive, mode, objective, output and storage-cache flags")
         if self.options["parsing-strictness"]:
             self.flags.append("--parsing-strictness=" + self.options["parsing-strictness"])
 
